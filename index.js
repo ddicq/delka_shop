@@ -30,8 +30,8 @@ const gateKb = m => ({ inline_keyboard: m.map(c => [{ text: "📢 @" + c, url: "
 const rub = k => (k / 100).toLocaleString("ru-RU") + " ₽";
 const welcome = id => tg("sendMessage", {
   chat_id: id, parse_mode: "HTML",
-  text: "<b>Добро пожаловать в delka shop!</b>\n\nПокупай софты, обучения, сервисы по выгодной цене!\nОткрывай каталог в веб-приложении по кнопке ниже!\nКанал с новостями и бонусами: @delka_shop",
-  reply_markup: { inline_keyboard: [[{ text: "🛍 Открыть каталог", web_app: { url: BASE } }], [{ text: "📢 Перейти в канал", url: "https://t.me/delka_shop" }]] }
+  text: "✨ <b>Добро пожаловать в delka shop!</b> ✨\n\nМагазин цифровых товаров по выгодным ценам. Покупай быстро, прямо в Telegram 💙\n\n🛍 <b>Что у нас есть</b>\n<blockquote>💻 <b>Софты</b> — программы и инструменты\n🎓 <b>Обучения</b> — курсы и гайды\n⚡ <b>Сервисы</b> — подписки и аккаунты</blockquote>\n🎁 <b>Бонусы и выгода</b>\n<blockquote>🎰 Рулетка с денежными призами\n👥 18% с пополнений друзей по твоей ссылке\n✅ 25 ₽ за подписку на каждый наш канал\n⭐ Пополнение баланса звёздами Telegram</blockquote>\n📢 Новости и бонусы: @delka_shop\n\nОткрывай каталог в веб-приложении по кнопке ниже 👇",
+  reply_markup: { inline_keyboard: [[{ text: "🛍 Открыть каталог", web_app: { url: BASE } }], [{ text: "📢 Наш канал", url: "https://t.me/delka_shop" }, { text: "🛟 Поддержка", url: "https://t.me/delkasupportbot" }]] }
 });
 const upsert = (u, ref) => q("INSERT INTO users(id,first_name,last_name,username,photo,ref_by) VALUES($1,$2,$3,$4,$5,(SELECT id FROM users WHERE id=$6::bigint AND id<>$1)) ON CONFLICT(id) DO UPDATE SET first_name=$2,last_name=$3,username=$4,photo=COALESCE(NULLIF($5,''),users.photo)", [u.id, u.first_name || "", u.last_name || "", u.username || "", u.photo_url || "", ref || null]);
 const esc = s => String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
@@ -45,8 +45,7 @@ const addBal = (uid, kop, type, from, note) => q("WITH u AS (UPDATE users SET ba
 
 async function entry(u, chat, ref) {
   await upsert(u, ref);
-  let m; try { m = await missing(u.id, true); } catch (e) { console.error(e.message); return tg("sendMessage", { chat_id: chat, text: "⚠️ Не удалось проверить подписку. Попробуйте позже." }); }
-  return m.length ? tg("sendMessage", { chat_id: chat, parse_mode: "HTML", text: gateText(m), reply_markup: gateKb(m) }) : welcome(chat);
+  return welcome(chat);
 }
 async function credit(uid, stars, charge) {
   const kop = stars * RATE * 100;
@@ -61,25 +60,8 @@ async function credit(uid, stars, charge) {
 async function handle(u) {
   if (u.pre_checkout_query) return tg("answerPreCheckoutQuery", { pre_checkout_query_id: u.pre_checkout_query.id, ok: true });
   if (u.callback_query && /^bc_/.test(u.callback_query.data || "")) return bcCallback(u.callback_query);
-  if (u.callback_query) {
-    const c = u.callback_query, m = c.message; let miss;
-    try { miss = await missing(c.from.id, true); } catch (e) { return tg("answerCallbackQuery", { callback_query_id: c.id, text: "Не удалось проверить подписку", show_alert: true }); }
-    if (miss.length) {
-      await tg("answerCallbackQuery", { callback_query_id: c.id, text: "Вы ещё не подписались на: " + miss.map(x => "@" + x).join(", "), show_alert: true });
-      return tg("editMessageText", { chat_id: m.chat.id, message_id: m.message_id, parse_mode: "HTML", text: gateText(miss), reply_markup: gateKb(miss) }).catch(() => {});
-    }
-    await tg("answerCallbackQuery", { callback_query_id: c.id });
-    await tg("deleteMessage", { chat_id: m.chat.id, message_id: m.message_id }).catch(() => {});
-    return welcome(m.chat.id);
-  }
-  if (u.chat_member) { // человек отписался от канала
-    const c = u.chat_member, un = (c.chat.username || "").toLowerCase(), id = c.new_chat_member.user.id;
-    if (CH.includes(un) && ["left", "kicked"].includes(c.new_chat_member.status) && (await q("SELECT 1 FROM users WHERE id=$1", [id])).length) {
-      cache.delete(id); const m = await missing(id, true);
-      return tg("sendMessage", { chat_id: id, parse_mode: "HTML", text: "⚠️ Вы отписались от @" + un + ". Доступ к магазину закрыт, пока вы не подпишетесь снова.\n\n" + gateText(m), reply_markup: gateKb(m) }).catch(() => {});
-    }
-    return;
-  }
+  if (u.callback_query) { await tg("answerCallbackQuery", { callback_query_id: u.callback_query.id }).catch(() => {}); return welcome(u.callback_query.from.id); }
+  if (u.chat_member) return;
   const msg = u.message; if (!msg) return;
   if (msg.successful_payment) {
     const p = msg.successful_payment; if (p.currency !== "XTR") return;
@@ -156,8 +138,7 @@ function auth(init) {
 }
 async function api(res, path, b) {
   const u = auth(b.initData); if (!u) return send(res, 401, { error: "auth" });
-  await upsert(u); let m;
-  try { m = await missing(u.id); } catch (e) { console.error(e.message); return send(res, 503, { error: "check" }); }
+  await upsert(u); const m = [];
   if (path === "/api/me") {
     const r = await q("SELECT balance_kop FROM users WHERE id=$1", [u.id]);
     return send(res, 200, { user: { id: u.id, name: [u.first_name, u.last_name].filter(Boolean).join(" "), photo: u.photo_url || "" }, missing: m, balance: Number(r[0].balance_kop) / 100, rate: RATE });
@@ -176,13 +157,20 @@ async function api(res, path, b) {
   }
   if (path === "/api/bonus") {
     const r = (await q("SELECT (SELECT count(*) FROM users WHERE ref_by=$1) AS n,(SELECT count(*) FROM tasks_done WHERE user_id=$1 AND task='inv25') AS d,(SELECT count(*) FROM spin_tickets WHERE user_id=$1 AND NOT used) AS t,(SELECT count(*) FROM ad_rewards WHERE user_id=$1 AND created_at>now()-interval '24 hours') AS au,(SELECT count(*) FROM ad_rewards WHERE user_id=$1 AND NOT used) AS aq,GREATEST(0,EXTRACT(EPOCH FROM last_spin+interval '12 hours'-now())) AS w FROM users WHERE id=$1", [u.id]))[0];
-    return send(res, 200, { invited: Number(r.n), done: Number(r.d) > 0, tickets: Number(r.t), wait: Math.ceil(Number(r.w) || 0), prizes: PRIZES, cost: 8, adLeft: Math.max(0, 2 - Number(r.au)), adTickets: Number(r.aq), adBlock: process.env.ADSGRAM_BLOCK_ID || "" });
+    return send(res, 200, { invited: Number(r.n), done: Number(r.d) > 0, tasks: (await q("SELECT task FROM tasks_done WHERE user_id=$1", [u.id])).map(x => x.task), tickets: Number(r.t), wait: Math.ceil(Number(r.w) || 0), prizes: PRIZES, cost: 8, adLeft: Math.max(0, 2 - Number(r.au)), adTickets: Number(r.aq), adBlock: process.env.ADSGRAM_BLOCK_ID || "" });
   }
   if (path === "/api/claim") {
-    const n = Number((await q("SELECT count(*) AS n FROM users WHERE ref_by=$1", [u.id]))[0].n);
-    if (n < 25) return send(res, 400, { error: "not_yet" });
-    if (!(await q("INSERT INTO tasks_done(user_id,task) VALUES($1,'inv25') ON CONFLICT DO NOTHING RETURNING 1 AS ok", [u.id])).length) return send(res, 400, { error: "done" });
-    return send(res, 200, { balance: (await addBal(u.id, 10000, "bonus", null, "Задание: пригласить 25 друзей")) / 100 });
+    const task = b.task || "inv25"; let kop = 10000, note = "Задание: пригласить 25 друзей";
+    if (task === "inv25") {
+      const n = Number((await q("SELECT count(*) AS n FROM users WHERE ref_by=$1", [u.id]))[0].n);
+      if (n < 25) return send(res, 400, { error: "not_yet" });
+    } else if (task.startsWith("sub_") && CH.includes(task.slice(4))) {
+      let miss; try { miss = await missing(u.id, true); } catch (e) { console.error(e.message); return send(res, 503, { error: "check" }); }
+      if (miss.includes(task.slice(4))) return send(res, 400, { error: "not_subscribed" });
+      kop = 2500; note = "Подписка на @" + task.slice(4);
+    } else return send(res, 400, { error: "task" });
+    if (!(await q("INSERT INTO tasks_done(user_id,task) VALUES($1,$2) ON CONFLICT DO NOTHING RETURNING 1 AS ok", [u.id, task])).length) return send(res, 400, { error: "done" });
+    return send(res, 200, { balance: (await addBal(u.id, kop, "bonus", null, note)) / 100 });
   }
   if (path === "/api/spin") {
     const t = b.mode === "ticket";
@@ -340,7 +328,7 @@ function shr(){tg.openTelegramLink("https://t.me/share/url?url="+encodeURICompon
 function sb(x){bs=x;renderB()}
 function loadB(){api("/api/bonus").then(function(j){if(j.error)return;bd=j;bd.t0=Date.now();renderB()})}
 function renderB(){if(!bd||busy)return;var h='<div class="top"><div class="logo"><i>d</i>Бонусы</div></div><div class="seg"><button class="'+(bs?"":"on")+'" onclick="sb(0)">Задания</button><button class="'+(bs?"on":"")+'" onclick="sb(1)">Рулетка</button></div>';
- if(!bs){var p=Math.min(bd.invited,25),ok=bd.invited>=25;h+='<div class="card"><div class="row"><div class="ic sm" style="--g1:#2f6bff;--g2:#19c3ff"><svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.5"/><path d="M2 20c0-3.5 3.2-6 7-6s7 2.5 7 6"/><circle cx="17" cy="9" r="2.5"/><path d="M17 14c3 0 5 2 5 5"/></svg></div><div><b>Пригласи 25 друзей</b><span>Награда 100 ₽ · выполняется один раз</span></div></div><div class="bar"><i style="width:'+p*4+'%"></i></div><div class="meta">'+p+' из 25</div>'+(bd.done?'<button class="go" disabled>Выполнено ✓</button>':'<button class="go" '+(ok?'':'disabled')+' onclick="claim()">'+(ok?'Забрать 100 ₽':'Приглашайте друзей по ссылке')+'</button>')+'</div>'}
+ if(!bs){h+=tasksHtml()}
  else{var n=bd.prizes.length,s=360/n,w="",cl=["#1d4fe0","#0e2a6b","#0a7cff"];bd.prizes.forEach(function(z,i){var a=i*s*Math.PI/180,b=(i+1)*s*Math.PI/180;w+='<path d="M0 0L'+100*Math.sin(a)+' '+-100*Math.cos(a)+'A100 100 0 0 1 '+100*Math.sin(b)+' '+-100*Math.cos(b)+'Z" fill="'+(i===n-1?"#12b7e8":cl[i%3])+'" stroke="#050810" stroke-width="2"/><text transform="rotate('+(i+.5)*s+') translate(0,-66)" text-anchor="middle" dominant-baseline="middle" fill="#fff" stroke="none" font-size="15" font-weight="700">'+z[0]+' ₽</text>'});
  h+='<div class="wheelw"><div class="ptr"></div><div id="wh" style="transform:rotate('+rot+'deg)"><svg viewBox="-104 -104 208 208">'+w+'<circle r="13" fill="#050810" stroke="#19c3ff" stroke-width="2"/></svg></div></div><button class="go" id="sp" onclick="spin()">'+(bd.tickets?"Крутить (прокрутка оплачена)":bd.wait>0?"Крутить за "+bd.cost+" ⭐":"Крутить бесплатно")+'</button>'+(bd.adBlock&&(bd.adLeft>0||bd.adTickets)?'<button class="go alt" style="margin-top:10px" onclick="ad()">'+(bd.adTickets?"Крутить (награда за рекламу)":"📺 Смотреть рекламу · осталось "+bd.adLeft+" из 2")+'</button>':'')+'<div class="get" id="cd"></div><div class="pz">'+bd.prizes.map(function(z){return'<span><b>'+z[0]+' ₽</b> · '+z[1]/10+'%</span>'}).join("")+'</div>'}
  $("v-b").innerHTML=h;tick()}
@@ -354,6 +342,12 @@ function ad(){if(busy)return;if(bd.adTickets){go("ad");return}
  if(!window.Adsgram){toast("Реклама недоступна");return}
  try{window.Adsgram.init({blockId:bd.adBlock}).show().then(function(r){if(r.done)waitAd();else toast("Досмотрите рекламу до конца")}).catch(function(){toast("Реклама сейчас недоступна, попробуйте позже")})}catch(e){toast("Реклама сейчас недоступна")}}
 function waitAd(){var n=0,t=setInterval(function(){api("/api/bonus").then(function(d){if(d.adTickets||++n>10){clearInterval(t);d.t0=Date.now();bd=d;renderB();if(d.adTickets)go("ad");else toast("Награда не пришла, попробуйте позже")}})},1200)}
+function tk(ic,t,d,body){return'<div class="card"><div class="row"><div class="ic sm" style="--g1:#2f6bff;--g2:#19c3ff">'+ic+'</div><div><b>'+t+'</b><span>'+d+'</span></div></div>'+body+'</div>'}
+function tasksHtml(){var p=Math.min(bd.invited,25),ok=bd.invited>=25,T=bd.tasks||[],svgU='<svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.5"/><path d="M2 20c0-3.5 3.2-6 7-6s7 2.5 7 6"/><circle cx="17" cy="9" r="2.5"/><path d="M17 14c3 0 5 2 5 5"/></svg>',svgC='<svg viewBox="0 0 24 24"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/></svg>';
+ var h=tk(svgU,"Пригласи 25 друзей","Награда 100 ₽ · один раз",'<div class="bar"><i style="width:'+p*4+'%"></i></div><div class="meta">'+p+' из 25</div>'+(bd.done?'<button class="go" disabled>Выполнено ✓</button>':'<button class="go" '+(ok?'':'disabled')+' onclick="claim()">'+(ok?'Забрать 100 ₽':'Приглашайте друзей по ссылке')+'</button>'));
+ ["delka_shop","delkateam"].forEach(function(c){var d=T.indexOf("sub_"+c)>-1;h+=tk(svgC,"Подпишись на @"+c,"Награда 25 ₽ · один раз",d?'<button class="go" disabled>Выполнено ✓</button>':'<div class="two"><button class="go alt" data-c="'+c+'" onclick="openCh(this.dataset.c)">Подписаться</button><button class="go" data-c="'+c+'" onclick="chk(this.dataset.c)">Проверить</button></div>')});
+ return h}
+function chk(c){api("/api/claim",{task:"sub_"+c}).then(function(j){if(j.error==="not_subscribed"){toast("Вы ещё не подписаны на @"+c);return}if(j.error){toast("Не удалось проверить, попробуйте позже");return}setBal(j.balance);toast("Начислено 25 ₽ 🎉");loadB()})}
 document.addEventListener("visibilitychange",function(){if(!document.hidden)load()});
 load();
 </script></body></html>`;
