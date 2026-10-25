@@ -34,7 +34,14 @@ const welcome = id => tg("sendMessage", {
   reply_markup: { inline_keyboard: [[{ text: "🛍 Открыть каталог", web_app: { url: BASE } }], [{ text: "📢 Перейти в канал", url: "https://t.me/delka_shop" }]] }
 });
 const upsert = (u, ref) => q("INSERT INTO users(id,first_name,last_name,username,photo,ref_by) VALUES($1,$2,$3,$4,$5,(SELECT id FROM users WHERE id=$6::bigint AND id<>$1)) ON CONFLICT(id) DO UPDATE SET first_name=$2,last_name=$3,username=$4,photo=COALESCE(NULLIF($5,''),users.photo)", [u.id, u.first_name || "", u.last_name || "", u.username || "", u.photo_url || "", ref || null]);
-const addBal = (uid, kop, type, from, note) => q("WITH u AS (UPDATE users SET balance_kop=balance_kop+$2 WHERE id=$1 RETURNING balance_kop) INSERT INTO tx(user_id,type,kop,ref_user,note) VALUES($1,$3,$2,$4,$5) RETURNING (SELECT balance_kop FROM u) AS b", [uid, kop, type, from || null, note || ""]).then(r => Number(r[0].b));
+const esc = s => String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+const TYS = { stars: ["⭐", "Пополнение звёздами"], crypto: ["₿", "Пополнение криптой"], bonus: ["🎁", "Бонус за задание"], roulette: ["🎰", "Рулетка"], ref: ["👥", "Реферал"], purchase: ["🛒", "Покупка"] };
+async function notify(uid, type, kop, note, from, bal) {
+  const y = TYS[type] || ["💠", type]; let who = "";
+  if (from) { const r = await q("SELECT first_name FROM users WHERE id=$1", [from]); if (r[0]) who = "\nот " + esc(r[0].first_name); }
+  await tg("sendMessage", { chat_id: uid, parse_mode: "HTML", text: y[0] + " <b>" + y[1] + "</b>" + who + (note ? "\n" + esc(note) : "") + "\n<b>" + (kop < 0 ? "−" : "+") + rub(Math.abs(kop)) + "</b>\n💼 Баланс: <b>" + rub(bal) + "</b>" });
+}
+const addBal = (uid, kop, type, from, note) => q("WITH u AS (UPDATE users SET balance_kop=balance_kop+$2 WHERE id=$1 RETURNING balance_kop) INSERT INTO tx(user_id,type,kop,ref_user,note) VALUES($1,$3,$2,$4,$5) RETURNING (SELECT balance_kop FROM u) AS b", [uid, kop, type, from || null, note || ""]).then(r => { const b = Number(r[0].b); notify(uid, type, kop, note, from, b).catch(e => console.error(e.message)); return b; });
 
 async function entry(u, chat, ref) {
   await upsert(u, ref);
@@ -47,12 +54,13 @@ async function credit(uid, stars, charge) {
   if (!r.length) return null;
   if (r[0].r) { // 18% пригласившему
     const ref = r[0].r, bonus = Math.floor(kop * REF / 100);
-    addBal(ref, bonus, "ref", uid, "").then(() => tg("sendMessage", { chat_id: ref, text: "💸 Ваш реферал пополнил баланс. Вам начислено " + rub(bonus) + "!" })).catch(e => console.error(e.message));
+    addBal(ref, bonus, "ref", uid, "18% с пополнения").catch(e => console.error(e.message));
   }
   return Number(r[0].b);
 }
 async function handle(u) {
   if (u.pre_checkout_query) return tg("answerPreCheckoutQuery", { pre_checkout_query_id: u.pre_checkout_query.id, ok: true });
+  if (u.callback_query && /^bc_/.test(u.callback_query.data || "")) return bcCallback(u.callback_query);
   if (u.callback_query) {
     const c = u.callback_query, m = c.message; let miss;
     try { miss = await missing(c.from.id, true); } catch (e) { return tg("answerCallbackQuery", { callback_query_id: c.id, text: "Не удалось проверить подписку", show_alert: true }); }
@@ -87,9 +95,57 @@ async function handle(u) {
       reply_markup: { inline_keyboard: [[{ text: "🛍 Перейти в каталог", web_app: { url: BASE } }]] }
     });
   }
+  if (msg.chat.type === "private" && isAdmin(msg.from.id) && await adminFlow(msg)) return;
   if (msg.chat.type === "private") { const rm = /^\/start ref(\d+)/.exec(msg.text || ""); return entry(msg.from, msg.chat.id, rm && rm[1]); }
 }
 
+const ADMINS = (process.env.ADMIN_IDS || "").split(",").map(x => x.trim()).filter(Boolean);
+const isAdmin = id => ADMINS.includes(String(id));
+const bc = new Map(), sleep = ms => new Promise(r => setTimeout(r, ms));
+function parseKb(t) {
+  const rows = [];
+  for (const line of t.split("\n")) { const m = /^(.+?)\s+[-–—]\s+((?:https?:\/\/|t\.me\/)\S+)$/.exec(line.trim()); if (m) rows.push([{ text: m[1], url: m[2].startsWith("http") ? m[2] : "https://" + m[2] }]); }
+  return rows;
+}
+async function adminFlow(msg) {
+  const id = msg.from.id, st = bc.get(id), t = (msg.text || "").trim();
+  if (t.toLowerCase() === "+рассылка") { bc.set(id, { step: "msg" }); await tg("sendMessage", { chat_id: id, text: "📣 Отправьте сообщение для рассылки: текст, фото, видео, файл, с форматированием и премиум-эмодзи. Отмена: /cancel" }); return true; }
+  if (!st) return false;
+  if (t === "/cancel") { bc.delete(id); await tg("sendMessage", { chat_id: id, text: "Рассылка отменена." }); return true; }
+  if (st.step === "msg") {
+    bc.set(id, { step: "btn", mid: msg.message_id });
+    await tg("sendMessage", { chat_id: id, text: "Добавить кнопки? Отправьте по одной на строке в формате:\nТекст кнопки - https://ссылка\n\nИли отправьте «нет»." }); return true;
+  }
+  if (st.step === "btn") {
+    const no = /^(нет|no|-)$/i.test(t), kb = no ? [] : parseKb(t);
+    if (!no && !kb.length) { await tg("sendMessage", { chat_id: id, text: "Не понял формат. Пример:\nКаталог - https://t.me/delka_shop" }); return true; }
+    st.kb = kb; st.step = "ok";
+    const rm = kb.length ? { inline_keyboard: kb } : undefined;
+    await tg("copyMessage", { chat_id: id, from_chat_id: id, message_id: st.mid, reply_markup: rm });
+    const n = (await q("SELECT count(*) AS n FROM users"))[0].n;
+    await tg("sendMessage", { chat_id: id, text: "Так увидят сообщение. Отправить " + n + " пользователям?", reply_markup: { inline_keyboard: [[{ text: "✅ Отправить", callback_data: "bc_yes" }, { text: "✖️ Отмена", callback_data: "bc_no" }]] } });
+    return true;
+  }
+  return false;
+}
+async function bcCallback(c) {
+  const id = c.from.id, st = bc.get(id);
+  await tg("answerCallbackQuery", { callback_query_id: c.id }).catch(() => {});
+  if (!isAdmin(id) || !st || st.step !== "ok") return;
+  bc.delete(id);
+  if (c.data === "bc_no") return tg("sendMessage", { chat_id: id, text: "Рассылка отменена." });
+  const users = await q("SELECT id FROM users"), rm = st.kb.length ? { inline_keyboard: st.kb } : undefined;
+  await tg("sendMessage", { chat_id: id, text: "🚀 Рассылка запущена: " + users.length + " получателей." });
+  let ok = 0, fail = 0;
+  for (const u of users) {
+    for (let a = 0; a < 2; a++) {
+      try { await tg("copyMessage", { chat_id: u.id, from_chat_id: id, message_id: st.mid, reply_markup: rm }); ok++; break; }
+      catch (e) { const m = /retry after (\d+)/.exec(e.message); if (m && a === 0) await sleep(m[1] * 1000 + 500); else { fail++; break; } }
+    }
+    await sleep(40);
+  }
+  return tg("sendMessage", { chat_id: id, text: "✅ Рассылка завершена.\nДоставлено: " + ok + "\nНе доставлено: " + fail + " (заблокировали бота)" });
+}
 function auth(init) {
   if (!init) return null;
   const p = new URLSearchParams(init), h = p.get("hash"); p.delete("hash");
@@ -193,7 +249,7 @@ body{background:radial-gradient(110% 50% at 50% -8%,rgba(47,107,255,.28),transpa
 .chip{background:var(--s2);border:1px solid var(--l);color:var(--t);border-radius:99px;padding:8px 14px;font-family:inherit;font-weight:600;font-size:14px}
 h1{font-size:34px;letter-spacing:-1px;font-weight:800}.sub{color:var(--m);margin:4px 0 22px}
 .cat{width:100%;display:flex;justify-content:space-between;align-items:center;text-align:left;color:var(--t);font-family:inherit;background:linear-gradient(135deg,rgba(47,107,255,.16),var(--s) 70%);border:1px solid var(--l);border-radius:26px;padding:20px;margin-bottom:14px}
-.cat b{display:block;font-size:22px;letter-spacing:-.4px}.cat span{display:block;color:var(--m);margin:2px 0 10px}.cat em{font-style:normal;font-size:12px;color:var(--b);background:rgba(25,195,255,.1);padding:4px 10px;border-radius:99px}
+.cat b{display:block;font-size:22px;letter-spacing:-.4px}.cat span{display:block;color:var(--m);margin:2px 0 10px}.cat em{display:inline-block;margin-top:10px;font-style:normal;font-size:12px;color:var(--b);background:rgba(25,195,255,.1);padding:4px 10px;border-radius:99px}
 .ic{width:72px;height:72px;border-radius:22px;display:grid;place-items:center;background:linear-gradient(135deg,var(--g1),var(--g2));box-shadow:0 14px 34px -10px var(--g1);flex:none}
 svg{width:32px;height:32px;fill:none;stroke:#fff;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
 .item{background:var(--s);border:1px solid var(--l);border-radius:20px;padding:16px;margin-bottom:12px}.item b{display:block;font-size:17px}.item span{color:var(--m);display:block;margin:2px 0 8px}.item strong{color:var(--b)}
@@ -253,9 +309,9 @@ function esc(s){return String(s).replace(/[&<>"]/g,function(c){return{"&":"&amp;
 function rub(n){return n.toLocaleString("ru-RU")+" ₽"}
 function toast(t){var e=$("toast");e.textContent=t;e.className="on";setTimeout(function(){e.className=""},2400)}
 function api(p,b){b=b||{};b.initData=tg.initData;return fetch(p,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(b)}).then(function(r){return r.json().then(function(j){j.s=r.status;return j})})}
-function show(v){["v-c","v-k","v-p","v-l","v-b","v-r"].forEach(function(x){$(x).className="view"+(x===v?" on":"")});$("tabs").style.display=v==="v-l"?"none":"flex";var on={c:v==="v-c"||v==="v-k",b:v==="v-b",r:v==="v-r",p:v==="v-p"};["c","b","r","p"].forEach(function(k){$("t-"+k).className=on[k]?"on":""});if(v==="v-b")loadB();if(v==="v-r")loadR();if(v==="v-p")loadH();scrollTo(0,0)}
+function show(v){["v-c","v-k","v-p","v-l","v-b","v-r"].forEach(function(x){$(x).className="view"+(x===v?" on":"")});$("tabs").style.display=v==="v-l"?"none":"flex";var on={c:v==="v-c"||v==="v-k",b:v==="v-b",r:v==="v-r",p:v==="v-p"};["c","b","r","p"].forEach(function(k){$("t-"+k).className=on[k]?"on":""});if(v==="v-b")loadB();if(v==="v-r")loadR();if(v==="v-p"){load();loadH()}scrollTo(0,0)}
 function icon(c){return'<div class="ic" style="--g1:'+c.c[0]+';--g2:'+c.c[1]+'"><svg viewBox="0 0 24 24">'+c.i+'</svg></div>'}
-$("cats").innerHTML=CATS.map(function(c,i){return'<button class="cat" onclick="openCat('+i+')"><div><b>'+c.n+'</b><span>'+c.d+'</span><em>'+(c.items.length?c.items.length+" товаров":"Скоро")+'</em></div>'+icon(c)+'</button>'}).join("");
+$("cats").innerHTML=CATS.map(function(c,i){return'<button class="cat" onclick="openCat('+i+')"><div><b>'+c.n+'</b><em>'+(c.items.length?c.items.length+" товаров":"Скоро")+'</em></div>'+icon(c)+'</button>'}).join("");
 function openCat(i){var c=CATS[i];$("kt").textContent=c.n;$("ki").innerHTML=c.items.length?c.items.map(function(p){return'<div class="item"><b>'+esc(p.t)+'</b><span>'+esc(p.d)+'</span><strong>'+rub(p.p)+'</strong></div>'}).join(""):'<div class="empty">'+icon(c)+'<b>Здесь скоро появятся товары</b><span>Подпишитесь на @delka_shop, чтобы не пропустить новинки</span></div>';show("v-k")}
 function openCh(c){tg.openTelegramLink("https://t.me/"+c)}
 function renderP(){var u=me.user;$("v-p").innerHTML='<div class="top"><div class="logo"><i>d</i>Профиль</div></div><div class="who">'+av(u.name,u.photo)+'<h2>'+esc(u.name)+'</h2><button class="id" onclick="cp()">ID '+u.id+'</button></div><div class="bal"><span>Баланс</span><strong>'+rub(me.balance)+'</strong><button onclick="openSheet()">Пополнить баланс</button></div><h2 class="h2">История операций</h2><div id="hist">'+hh+'</div>'}
@@ -275,8 +331,8 @@ var hh="",rd=null,bd=null,bs=0,rot=0,busy=false;
 var TY={stars:["⭐","Пополнение звёздами"],crypto:["₿","Пополнение криптой"],bonus:["🎁","Бонус за задание"],roulette:["🎰","Рулетка"],ref:["👥","Реферал"]};
 function av(n,p){return'<div class="av"><span>'+esc((n||"?").trim().charAt(0).toUpperCase())+'</span>'+(p?'<img src="'+esc(p)+'" onerror="this.remove()">':'')+'</div>'}
 function dt(s){return new Date(s).toLocaleString("ru-RU",{day:"numeric",month:"short",hour:"2-digit",minute:"2-digit"})}
-function setBal(b){me.balance=b;$("hb").textContent=rub(b)}
-function loadH(){api("/api/history").then(function(j){if(j.error)return;hh=j.list.length?j.list.map(function(t){var y=TY[t.type]||["💠",t.type];return'<div class="ur"><div class="tl">'+y[0]+'</div><div class="nm"><b>'+y[1]+'</b><span>'+(t.type==="ref"&&t.fn?"от "+esc(t.fn)+" · ":(t.note?esc(t.note)+" · ":""))+dt(t.created_at)+'</span></div><strong>+'+rub(t.kop/100)+'</strong></div>'}).join(""):'<div class="empty small">Операций пока нет</div>';if($("hist"))$("hist").innerHTML=hh})}
+function setBal(b){me.balance=b;$("hb").textContent=rub(b);renderP()}
+function loadH(){api("/api/history").then(function(j){if(j.error)return;hh=j.list.length?j.list.map(function(t){var y=TY[t.type]||["💠",t.type];return'<div class="ur"><div class="tl">'+y[0]+'</div><div class="nm"><b>'+y[1]+'</b><span>'+(t.type==="ref"&&t.fn?"от "+esc(t.fn)+" · ":(t.note?esc(t.note)+" · ":""))+dt(t.created_at)+'</span></div><strong>'+(t.kop<0?"−":"+")+rub(Math.abs(t.kop)/100)+'</strong></div>'}).join(""):'<div class="empty small">Операций пока нет</div>';if($("hist"))$("hist").innerHTML=hh})}
 function loadR(){api("/api/ref").then(function(j){if(j.error)return;rd=j;renderR()})}
 function renderR(){$("v-r").innerHTML='<div class="top"><div class="logo"><i>d</i>Рефералы</div></div><div class="bal"><span>Заработано с рефералов</span><strong>'+rub(rd.earned)+'</strong><span>Приглашено: '+rd.count+' · вы получаете 18% с каждого пополнения друга</span></div><div class="card" style="margin-top:14px"><span class="lbl">Ваша реферальная ссылка</span><div class="lnk">'+esc(rd.link)+'</div><div class="two"><button class="go" onclick="cpl()">Копировать</button><button class="go alt" onclick="shr()">Поделиться</button></div></div><h2 class="h2">Топ приглашённых</h2>'+(rd.list.length?rd.list.map(function(x,i){return'<div class="ur"><div class="n">'+(i+1)+'</div>'+av(x.name,x.photo)+'<div class="nm"><b>'+esc(x.name||"Без имени")+'</b><span>ID '+x.id+'</span></div><strong>+'+rub(x.earned)+'</strong></div>'}).join(""):'<div class="empty small">Пока никого. Отправьте ссылку друзьям.</div>')}
 function cpl(){try{navigator.clipboard.writeText(rd.link)}catch(e){}toast("Ссылка скопирована")}
